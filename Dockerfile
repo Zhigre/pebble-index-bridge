@@ -4,6 +4,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+# Normalize source permissions inside the image: restrictive host umasks must
+# not prevent the unprivileged runtime from reading application modules.
+RUN chmod -R a+rX /app/app
 RUN useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin bridge && mkdir -p /data && chown 10001:10001 /data && chmod 700 /data
 USER 10001:10001
 EXPOSE 8000
