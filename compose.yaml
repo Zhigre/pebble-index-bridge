@@ -8,6 +8,8 @@ services:
     env_file:
       - .env
     read_only: true
+    volumes:
+      - secondary-copies:/data
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -18,3 +20,6 @@ services:
     mem_limit: 128m
     cpus: 0.50
     stop_grace_period: 10s
+
+volumes:
+  secondary-copies:

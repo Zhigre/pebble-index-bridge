@@ -250,13 +250,12 @@ The supplied Compose file binds port 8000 to `127.0.0.1` only. This keeps the ap
 
 Do this **before** configuring Pebble. It separates server/Funnel problems from Pebble configuration problems.
 
-From another computer, send an Index-shaped request with a deliberately wrong token:
+From another computer, send an Index-shaped request without an authorization token:
 
 ```bash
 # Replace the hostname below with the public hostname shown by
 # `tailscale funnel status`
 curl -i -X POST https://your-server.your-tailnet.ts.net/index \
-  -H "Authorization: Bearer deliberately-wrong" \
   -F 'transcription=public connectivity test'
 ```
 
@@ -422,7 +421,6 @@ Look for `healthy` in the container status.
 ```bash
 # Replace this with your own Funnel hostname. A 401 response is expected.
 curl -i -X POST https://your-server.your-tailnet.ts.net/index \
-  -H "Authorization: Bearer deliberately-wrong" \
   -F 'transcription=public connectivity test'
 ```
 
@@ -498,3 +496,69 @@ Emergency shutdown of all Tailscale Funnel exposure:
 ```bash
 sudo tailscale funnel reset
 ```
+# Optional secondary destination
+
+GrokBot remains the primary destination. An optional independent HTTPS webhook
+receives the same normalized transcript. No primary reply is forwarded.
+The secondary service decides how to process captures and where to display replies.
+
+Configure the bridge's private `.env`:
+
+```dotenv
+SECONDARY_WEBHOOK_URL=https://your-secondary-service.example/capture
+SECONDARY_WEBHOOK_TOKEN=YOUR-SEPARATE-RANDOM-SECRET
+SECONDARY_OUTBOX_PATH=/data/secondary-copies.sqlite
+```
+
+Use a separate bearer credential of at least 32 characters. Blank URL and token
+disable copying. Keep actual addresses, credentials and agent-specific setup
+outside this public repository. The URL must use HTTPS without embedded
+credentials, query parameters or fragments; its path is yours to choose.
+
+## Webhook contract
+
+The bridge sends JSON containing `source` (`pebble-index-01`),
+`transcription`, `recordedAt` (a timestamp string or null), `client`,
+`bridgeRequestId`, and a stable `messageId`. Authentication uses a bearer token.
+The receiver must deduplicate by `messageId` before applying side effects.
+To acknowledge completed processing, return HTTP 200 with:
+
+```json
+{"messageId": "the-received-message-id", "status": "completed"}
+```
+
+A plain success response is insufficient: a matching completed receipt is required.
+This contract can be implemented by an agent or a private adapter.
+Confirm the receiver's behavior before enabling it: copies may trigger real actions.
+
+## Delivery and storage
+
+Copies are stored before the primary send and processed independently. Secondary
+connection failures do not prevent GrokBot delivery; primary failures leave the
+copy queued. Only the secondary worker retries, with a stable ID and capped
+backoff. Transport errors, HTTP 5xx and 429 retry; redirects, other unsuccessful
+receipts and authentication/validation failures require attention.
+
+A storage failure leaves primary forwarding active and reports `not_queued`
+in the `secondaryCopy` receipt. A `queued` receipt means stored for delivery,
+not completed processing.
+
+The named `secondary-copies` Docker volume holds personal transcripts. Back it
+up using SQLite's backup API or while stopped, including pending records and WAL
+state. Do not delete the volume during updates. The store is capped at 10,000
+records; review and archive completed records before capacity is exhausted.
+The container runs as UID 10001 with a read-only application filesystem.
+
+The ring delivery ID is preferred for deduplication. Otherwise the recording
+timestamp, client and transcript identify retries. Without a timestamp, separate
+requests cannot reliably be recognized as retries. Separate recording timestamps
+remain distinct even when the words match.
+
+Back up configuration and storage before rebuilding with
+`docker compose up -d --build`. Preserve existing Tailscale routes. Check the
+receiver's transcript limit against `MAX_TRANSCRIPTION_CHARS`; copies are never
+silently truncated.
+
+Qualification: `python -m unittest discover -s tests -v` uses synthetic inputs
+and mocked HTTP. Real ring delivery, receiver behavior and Docker/HTTPS operation
+still require deployment testing.

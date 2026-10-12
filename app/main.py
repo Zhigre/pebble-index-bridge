@@ -6,19 +6,21 @@ import re
 import time
 import unicodedata
 import uuid
+from contextlib import asynccontextmanager
 from collections import deque
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from app.secondary_outbox import SecondaryOutbox
+from app.secondary_worker import run_worker
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("index-bridge")
 # Avoid httpx/httpcore logging full webhook URLs (webhook URLs are sensitive identifiers).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-app = FastAPI(title="Pebble Index Bridge", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
 
 BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
 GROKBOT_WEBHOOK_URL = os.environ["GROKBOT_WEBHOOK_URL"]
@@ -32,6 +34,51 @@ RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 AUTH_FAILURE_ALERT_THRESHOLD = int(os.getenv("AUTH_FAILURE_ALERT_THRESHOLD", "10"))
 LOG_TRANSCRIPTIONS = os.getenv("LOG_TRANSCRIPTIONS", "false").lower() == "true"
+SECONDARY_WEBHOOK_URL = os.getenv("SECONDARY_WEBHOOK_URL", "").strip()
+SECONDARY_WEBHOOK_TOKEN = os.getenv("SECONDARY_WEBHOOK_TOKEN", "")
+SECONDARY_OUTBOX_PATH = os.getenv("SECONDARY_OUTBOX_PATH", "/data/secondary-copies.sqlite")
+secondary_outbox = None
+secondary_worker = None
+
+# Copy configuration is opt-in and uses its own capture-only credential. Docker
+# deployments use the owner's HTTPS endpoint. This does not alter GrokBot
+# configuration or expose the bridge's GrokBot key to the secondary receiver.
+if bool(SECONDARY_WEBHOOK_URL) != bool(SECONDARY_WEBHOOK_TOKEN):
+    raise RuntimeError("Configure both SECONDARY_WEBHOOK_URL and SECONDARY_WEBHOOK_TOKEN")
+if SECONDARY_WEBHOOK_URL:
+    parsed = urlparse(SECONDARY_WEBHOOK_URL)
+    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment or not parsed.hostname:
+        raise RuntimeError("SECONDARY_WEBHOOK_URL must be an HTTPS webhook endpoint without credentials or query")
+    if len(SECONDARY_WEBHOOK_TOKEN) < 32:
+        raise RuntimeError("SECONDARY_WEBHOOK_TOKEN must be at least 32 characters")
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    global secondary_outbox, secondary_worker
+    secondary_outbox = None
+    secondary_worker = None
+    if SECONDARY_WEBHOOK_URL:
+        try:
+            secondary_outbox = SecondaryOutbox(SECONDARY_OUTBOX_PATH)
+        except Exception:
+            log.error("secondary_copy_store_unavailable; primary forwarding remains active")
+        if secondary_outbox:
+            secondary_worker = asyncio.create_task(run_worker(secondary_outbox, SECONDARY_WEBHOOK_URL, SECONDARY_WEBHOOK_TOKEN, max(REQUEST_TIMEOUT, 55)))
+    try:
+        yield
+    finally:
+        if secondary_worker:
+            secondary_worker.cancel()
+            try:
+                await secondary_worker
+            except asyncio.CancelledError:
+                pass
+        if secondary_outbox:
+            secondary_outbox.close()
+
+
+app = FastAPI(title="Pebble Index Bridge", version="0.2.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 for name, url in (("GROKBOT_WEBHOOK_URL", GROKBOT_WEBHOOK_URL), ("SECURITY_ALERT_WEBHOOK_URL", SECURITY_ALERT_WEBHOOK_URL)):
     if url and urlparse(url).scheme.lower() != "https":
@@ -159,6 +206,14 @@ async def index_webhook(request: Request, authorization: str | None = Header(def
         log.info("transcription request_id=%s text=%r", request_id, text)
 
     payload = {"source": "pebble-index-01", "transcription": text, "recordedAt": recorded_at, "client": client_name, "bridgeRequestId": request_id}
+    copy_id = None
+    if secondary_outbox:
+        try:
+            copy_id = secondary_outbox.enqueue(payload, request.headers.get("x-index-delivery"))
+        except Exception:
+            # Copy storage failure must not take down the existing GrokBot path.
+            # Report it honestly in the receipt and logs; never claim it queued.
+            log.error("secondary_copy_not_queued request_id=%s", request_id)
     started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -172,4 +227,7 @@ async def index_webhook(request: Request, authorization: str | None = Header(def
     log.info("Grok Bot response request_id=%s status=%s elapsed_ms=%s", request_id, response.status_code, elapsed_ms)
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Grok Bot webhook returned HTTP {response.status_code}")
-    return {"ok": True, "requestId": request_id, "grokbotStatus": response.status_code}
+    receipt = {"ok": True, "requestId": request_id, "grokbotStatus": response.status_code}
+    if SECONDARY_WEBHOOK_URL:
+        receipt["secondaryCopy"] = {"status": "queued" if copy_id else "not_queued", "messageId": copy_id}
+    return receipt
