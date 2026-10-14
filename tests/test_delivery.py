@@ -65,6 +65,60 @@ def test_non_2xx_is_attention_without_reading_response_body(tmp_path):
     run(client.aclose())
 
 
+def test_upstream_outage_statuses_retry_with_backoff_then_need_attention(tmp_path):
+    # 2026-10-13: Grok answered 400 during a webhook incident, the note was
+    # parked as needs_attention and the FIFO froze behind it for 27 hours.
+    # A response that says "not accepted / unavailable" must retry on backoff.
+    for status in (400, 408, 425, 429, 502, 503, 504):
+        def handler(request: httpx.Request, status=status) -> httpx.Response:
+            return httpx.Response(status)
+
+        store = Store(tmp_path / f"queue-{status}.sqlite")
+        receipt = store.enqueue("hello", "1", "ring")
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        worker = DeliveryWorker(
+            store, "https://example.invalid/hook", "secret", max_attempts=2, client=client
+        )
+        assert run(worker.run_once()) is True
+        retry = store.get(receipt["id"])
+        assert retry["status"] == "retry", status
+        assert retry["lastErrorCode"] == f"http_{status}"
+        assert retry["nextAttemptAt"] >= int(time.time()) + 1
+        run(client.aclose())
+
+
+def test_upstream_outage_retry_budget_exhausts_to_attention(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    store = Store(tmp_path / "queue.sqlite")
+    receipt = store.enqueue("hello", "1", "ring")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    worker = DeliveryWorker(
+        store, "https://example.invalid/hook", "secret", max_attempts=1, client=client
+    )
+    assert run(worker.run_once()) is True
+    metadata = store.get(receipt["id"])
+    assert metadata["status"] == "needs_attention"
+    assert metadata["lastErrorCode"] == "http_503_exhausted"
+    assert metadata["httpStatus"] == 503
+    run(client.aclose())
+
+
+def test_auth_rejection_needs_attention_immediately(tmp_path):
+    for status in (401, 403):
+        def handler(request: httpx.Request, status=status) -> httpx.Response:
+            return httpx.Response(status)
+
+        store = Store(tmp_path / f"queue-{status}.sqlite")
+        receipt = store.enqueue("hello", "1", "ring")
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        worker = DeliveryWorker(store, "https://example.invalid/hook", "secret", client=client)
+        assert run(worker.run_once()) is True
+        assert store.get(receipt["id"])["status"] == "needs_attention"
+        run(client.aclose())
+
+
 def test_connect_failure_retries_but_read_timeout_needs_attention(tmp_path):
     def connect_failure(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)

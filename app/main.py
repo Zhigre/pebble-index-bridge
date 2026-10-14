@@ -368,7 +368,7 @@ def _build_worker(settings: Settings, store: Store) -> DeliveryWorker:
         settings.grokbot_webhook_url,
         settings.grokbot_webhook_key,
         timeout=settings.request_timeout_seconds,
-        max_attempts=12,
+        max_attempts=16,  # backoff caps at 1h: ~5h of retries, outlasts a provider incident
         retry_base=2,
         client=None,
     )

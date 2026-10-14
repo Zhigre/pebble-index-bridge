@@ -43,6 +43,13 @@ async def store_call(function: Callable[..., Any], *args: Any, **kwargs: Any) ->
     return result
 
 
+# Responses that mean "not accepted, try later". The Grok webhook returned 400
+# for every call during the 2026-10-13 incident. 500 stays operator-reviewed
+# because the body may have been processed before the error; 401/403 mean the
+# key is wrong and retrying cannot help.
+RETRYABLE_HTTP_STATUSES = frozenset({400, 408, 425, 429, 502, 503, 504})
+
+
 class DeliveryWorker:
     """Deliver one queue head at a time with conservative failure handling."""
 
@@ -159,6 +166,20 @@ class DeliveryWorker:
         log.info("delivery event_id=%s http_status=%d", event_id, status)
         if status == 200:
             await store_call(self.store.mark_delivered, event_id, http_status=status)
+        elif status in RETRYABLE_HTTP_STATUSES:
+            # The webhook answered and refused the body, so a resend cannot
+            # duplicate. Retry on backoff instead of freezing the FIFO.
+            if attempts < self.max_attempts:
+                await store_call(
+                    self.store.mark_retry, event_id, f"http_{status}", self._retry_at(attempts)
+                )
+            else:
+                await store_call(
+                    self.store.mark_attention,
+                    event_id,
+                    f"http_{status}_exhausted",
+                    http_status=status,
+                )
         else:
             await store_call(
                 self.store.mark_attention, event_id, f"http_{status}", http_status=status
