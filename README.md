@@ -178,7 +178,8 @@ An accepted request returns HTTP `202` once it is saved to the persistent outbox
 {
   "ok": true,
   "requestId": "...",
-  "delivery": "queued"
+  "delivery": "queued",
+  "destinations": ["grokbot"]
 }
 ```
 
@@ -400,6 +401,30 @@ The bridge converts Pebble's form fields into JSON:
 ```
 
 Existing installations should update `REQUEST_TIMEOUT_SECONDS=15` in `.env` to `45` before recreating the container; the existing value overrides the new default.
+
+## Multiple user-configured destinations
+
+Set `DESTINATIONS_JSON` in your private `.env` to forward every capture to one or more HTTPS webhooks. This list replaces `GROKBOT_WEBHOOK_URL` and `GROKBOT_WEBHOOK_KEY`; leave it blank to keep the existing single-destination setup. No secondary endpoint is enabled by default.
+
+```env
+# Example only: replace every endpoint and token with your own values.
+DESTINATIONS_JSON='[{"name":"grokbot","url":"https://primary.example/webhook","token":"replace-primary-token"},{"name":"archive","url":"https://archive.example/capture","token":"replace-archive-token","receipt":"completed"}]'
+```
+
+Each destination needs a unique lowercase `name`, an HTTPS `url`, and its own bearer `token`. Keep the JSON on one line and quote it as shown for Docker Compose. Credentials and URLs stay in `.env` and are never included in the capture payload. Recreate the container after configuration changes.
+
+Each capture is saved atomically for all configured destinations before returning 202. Each destination has a separate worker, retry history, and dead-letter state; a slow or rejected delivery cannot block another destination. The response includes the configured destination names. All destinations receive the same transcript, recording metadata, and `bridgeRequestId`.
+
+The optional `receipt` defaults to `http`, which accepts any 2xx response. Set it to `completed` for receivers using the secondary branch's protocol: the request also includes a stable `messageId` (`pebble_` followed by the capture UUID without hyphens), and a successful response must contain `{"messageId":"<same ID>","status":"completed"}`. A mismatched or missing receipt goes to dead letter for review. Both modes also send a stable `Idempotency-Key` header.
+
+Keep destination names stable: queued records are associated with the name and use its current URL/token when delivered. Drain pending records before changing a destination's URL or removing/renaming it. Removed destinations' records remain stored and appear in the local queue listing. Existing v0.2.0 records migrate to the name `grokbot`, so retain that name until they are delivered.
+
+When moving from the older secondary branch, drain/review its `secondary-copies` volume before switching. Its separate queue and `SECONDARY_*` variables are not automatically imported; preserve that volume until all captures are accounted for. Configure any desired copies in `DESTINATIONS_JSON` yourself.
+
+```bash
+# Replay only the archive delivery without resending to successful destinations.
+docker compose exec index-bridge python -m app.outbox replay REQUEST_ID --destination archive
+```
 
 ## Delivery queue and recovery
 

@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import json
 import logging
 import os
 import re
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from pydantic import BaseModel, ConfigDict
 from app import outbox
+from app.destinations import load_destinations
 from collections import deque
 from urllib.parse import urlparse
 
@@ -25,8 +27,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
-GROKBOT_WEBHOOK_URL = os.environ["GROKBOT_WEBHOOK_URL"]
-GROKBOT_WEBHOOK_KEY = os.environ["GROKBOT_WEBHOOK_KEY"]
+DESTINATIONS = load_destinations()
 SECURITY_ALERT_WEBHOOK_URL = os.getenv("SECURITY_ALERT_WEBHOOK_URL", "").strip()
 SECURITY_ALERT_WEBHOOK_KEY = os.getenv("SECURITY_ALERT_WEBHOOK_KEY", "").strip()
 REQUEST_TIMEOUT = httpx.Timeout(connect=10, read=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "45")), write=10, pool=10)
@@ -37,7 +38,7 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 AUTH_FAILURE_ALERT_THRESHOLD = int(os.getenv("AUTH_FAILURE_ALERT_THRESHOLD", "10"))
 LOG_TRANSCRIPTIONS = os.getenv("LOG_TRANSCRIPTIONS", "false").lower() == "true"
 
-for name, url in (("GROKBOT_WEBHOOK_URL", GROKBOT_WEBHOOK_URL), ("SECURITY_ALERT_WEBHOOK_URL", SECURITY_ALERT_WEBHOOK_URL)):
+for name, url in (("SECURITY_ALERT_WEBHOOK_URL", SECURITY_ALERT_WEBHOOK_URL),):
     if url and urlparse(url).scheme.lower() != "https":
         raise RuntimeError(f"{name} must use https://")
 if len(BRIDGE_TOKEN) < 32:
@@ -72,7 +73,7 @@ def safe_response(response, payload, secret):
     return repr(body[:1024])
 
 
-async def deliver(client, url, key, payload, request_id, attempt, kind):
+async def deliver(client, url, key, payload, request_id, attempt, kind, receipt="http"):
     headers = {"Content-Type": "application/json", "Idempotency-Key": request_id}
     if key:
         headers["Authorization"] = f"Bearer {key}"
@@ -87,26 +88,38 @@ async def deliver(client, url, key, payload, request_id, attempt, kind):
     log.info("delivery kind=%s request_id=%s attempt=%d status=%d elapsed_ms=%d", kind, request_id, attempt, status, round((time.monotonic()-started)*1000))
     if not 200 <= status < 300:
         log.warning("delivery_rejected kind=%s request_id=%s status=%d body=%s payload_summary=%s", kind, request_id, status, safe_response(response, payload, key), payload_summary(payload))
-    return 200 <= status < 300, status in (408, 429) or status >= 500, f"HTTP {status}", response.headers.get("Retry-After")
+    ok = 200 <= status < 300
+    if ok and receipt == "completed":
+        # Some receivers acknowledge processing separately from HTTP acceptance.
+        try:
+            result = response.json()
+            ok = isinstance(result, dict) and result.get("messageId") == payload["messageId"] and result.get("status") == "completed"
+        except ValueError:
+            ok = False
+        if not ok:
+            return False, False, "Invalid completion receipt", None
+    return ok, status in (408, 429) or status >= 500, f"HTTP {status}", response.headers.get("Retry-After")
 
 
-async def outbox_worker():
+async def outbox_worker(destination=None):
+    destination = destination or DESTINATIONS[0]
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         while True:
             try:
-                item = outbox.next_item()
+                item = outbox.next_item(destination.name)
                 if item is None:
                     await asyncio.sleep(1)
                     continue
                 request_id, encoded, attempts = item
-                import json
                 payload = json.loads(encoded)
+                if destination.receipt == "completed":
+                    payload = {**payload, "messageId": "pebble_" + request_id.replace("-", "")}
                 attempts += 1
-                ok, retryable, result, retry_after = await deliver(client, GROKBOT_WEBHOOK_URL, GROKBOT_WEBHOOK_KEY, payload, request_id, attempts, "capture")
+                ok, retryable, result, retry_after = await deliver(client, destination.url, destination.token, payload, request_id, attempts, destination.name, destination.receipt)
                 state = "delivered" if ok else "pending" if retryable and attempts < outbox.MAX_ATTEMPTS else "dead"
-                outbox.finish(request_id, attempts, state, result, outbox.retry_delay(attempts, retry_after) if state == "pending" else 0)
+                outbox.finish(request_id, attempts, state, result, outbox.retry_delay(attempts, retry_after) if state == "pending" else 0, destination=destination.name)
                 if state == "dead":
-                    log.error("delivery_dead request_id=%s reason=%s", request_id, result)
+                    log.error("delivery_dead destination=%s request_id=%s reason=%s", destination.name, request_id, result)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -119,18 +132,16 @@ async def lifespan(app):
     # Fail startup if the persistent volume is unavailable, rather than accept data we cannot save.
     with outbox.connect():
         pass
-    worker = asyncio.create_task(outbox_worker())
+    workers = [asyncio.create_task(outbox_worker(destination)) for destination in DESTINATIONS]
     try:
         yield
     finally:
-        worker.cancel()
-        try:
-            await worker
-        except asyncio.CancelledError:
-            pass
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
 
-app = FastAPI(title="Pebble Index Bridge", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title="Pebble Index Bridge", version="0.3.0", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 async def send_security_alert(event: str, severity: str, count: int, action: str):
@@ -236,8 +247,8 @@ async def index_webhook(request: Request, authorization: str | None = Header(def
 
     payload = CapturePayload(source="pebble-index-01", transcription=text, recordedAt=recorded_at, client=client_name, bridgeRequestId=request_id).model_dump()
     try:
-        outbox.enqueue(request_id, payload)
+        outbox.enqueue(request_id, payload, [destination.name for destination in DESTINATIONS])
     except Exception:
         log.error("outbox_enqueue_failed request_id=%s", request_id, exc_info=log.isEnabledFor(logging.DEBUG))
         raise HTTPException(status_code=503, detail="Could not persist capture")
-    return JSONResponse({"ok": True, "requestId": request_id, "delivery": "queued"}, status_code=202)
+    return JSONResponse({"ok": True, "requestId": request_id, "delivery": "queued", "destinations": [destination.name for destination in DESTINATIONS]}, status_code=202)

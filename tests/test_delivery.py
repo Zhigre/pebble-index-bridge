@@ -9,6 +9,7 @@ import pytest
 
 @pytest.fixture
 def bridge(tmp_path, monkeypatch):
+    monkeypatch.delenv("DESTINATIONS_JSON", raising=False)
     monkeypatch.setenv("BRIDGE_TOKEN", "a" * 32)
     monkeypatch.setenv("GROKBOT_WEBHOOK_URL", "https://example.test/hook")
     monkeypatch.setenv("GROKBOT_WEBHOOK_KEY", "secret-key")
@@ -54,7 +55,7 @@ def test_outbox_restart_and_replay(bridge):
     box.finish("id", 1, "dead", "HTTP 400")
     assert box.next_item() is None
     with box.connect() as db:
-        db.execute("UPDATE outbox SET state='pending', attempts=0, next_attempt=0 WHERE id='id'")
+        db.execute("UPDATE deliveries SET state='pending', attempts=0, next_attempt=0 WHERE id='id'")
     assert box.next_item()[0] == "id"
 
 
@@ -75,7 +76,7 @@ def test_worker_retries_after_outage_and_delivers(bridge, monkeypatch):
     box.enqueue("request-123", {"transcription": "saved"})
     calls = []
 
-    async def fake_deliver(client, url, key, payload, request_id, attempt, kind):
+    async def fake_deliver(client, url, key, payload, request_id, attempt, kind, receipt="http"):
         calls.append((request_id, attempt))
         if attempt == 1:
             return False, True, "ReadTimeout", None
@@ -89,7 +90,7 @@ def test_worker_retries_after_outage_and_delivers(bridge, monkeypatch):
         for _ in range(100):
             await asyncio.sleep(0.01)
             with box.connect() as db:
-                state = db.execute("SELECT state FROM outbox WHERE id='request-123'").fetchone()[0]
+                state = db.execute("SELECT state FROM deliveries WHERE id='request-123'").fetchone()[0]
             if state == "delivered":
                 break
         worker.cancel()
@@ -99,3 +100,76 @@ def test_worker_retries_after_outage_and_delivers(bridge, monkeypatch):
 
     assert asyncio.run(run()) == "delivered"
     assert calls == [("request-123", 1), ("request-123", 2)]
+
+
+def test_multiple_destinations_progress_independently(bridge, monkeypatch):
+    from app.destinations import Destination
+    destinations = [Destination("notes", "https://notes.example/hook", "notes-token"), Destination("archive", "https://archive.example/hook", "archive-token", "completed")]
+    monkeypatch.setattr(bridge, "DESTINATIONS", destinations)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.url.host == "notes.example":
+            raise httpx.ReadTimeout("outage")
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={"messageId": payload["messageId"], "status": "completed"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(bridge.httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    async def run():
+        async with real_client(transport=httpx.ASGITransport(app=bridge.app), base_url="http://test") as client:
+            response = await client.post("/index", headers={"Authorization": "Bearer " + "a" * 32}, files={"transcription": (None, "same words")})
+        assert response.json()["destinations"] == ["notes", "archive"]
+        workers = [asyncio.create_task(bridge.outbox_worker(item)) for item in destinations]
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            with bridge.outbox.connect() as db:
+                states = dict(db.execute("SELECT destination,state FROM deliveries"))
+            if states["archive"] == "delivered":
+                break
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        return states
+
+    assert asyncio.run(run()) == {"notes": "pending", "archive": "delivered"}
+    assert {req.headers["authorization"] for req in calls} == {"Bearer notes-token", "Bearer archive-token"}
+    assert len({req.headers["idempotency-key"] for req in calls}) == 1
+    assert {json.loads(req.content)["transcription"] for req in calls} == {"same words"}
+
+
+def test_invalid_completion_receipt_is_retained_for_review(bridge):
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "completed", "messageId": "wrong"}))) as client:
+            return await bridge.deliver(client, "https://example.test", "token", {"messageId": "expected"}, "id", 1, "copy", "completed")
+    assert asyncio.run(run())[:3] == (False, False, "Invalid completion receipt")
+
+
+def test_destination_config_validation(monkeypatch):
+    from app.destinations import load_destinations
+    config = [{"name": "notes", "url": "https://example.test/hook", "token": "private"}]
+    monkeypatch.setenv("DESTINATIONS_JSON", json.dumps(config))
+    assert load_destinations()[0].name == "notes"
+    for bad in [[], config * 2, [{**config[0], "url": "http://example.test"}], [{**config[0], "receipt": "unknown"}]]:
+        monkeypatch.setenv("DESTINATIONS_JSON", json.dumps(bad))
+        with pytest.raises(RuntimeError):
+            load_destinations()
+
+
+def test_legacy_outbox_migration_preserves_pending(bridge):
+    import sqlite3
+    with sqlite3.connect(bridge.outbox.DB_PATH) as db:
+        db.execute("CREATE TABLE outbox (id TEXT, payload TEXT, state TEXT, attempts INTEGER, next_attempt REAL, last_result TEXT)")
+        db.execute("INSERT INTO outbox VALUES ('old-id', '{}', 'pending', 2, 0, 'ReadTimeout')")
+    assert bridge.outbox.next_item("grokbot") == ("old-id", "{}", 2)
+    assert bridge.outbox.next_item("archive") is None
+
+
+def test_fanout_storage_rolls_back_if_any_copy_fails(bridge):
+    import sqlite3
+    with pytest.raises(sqlite3.IntegrityError):
+        bridge.outbox.enqueue("id", {"transcription": "saved"}, ["notes", "notes"])
+    with bridge.outbox.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 0
