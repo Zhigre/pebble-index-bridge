@@ -7,6 +7,8 @@ services:
       - "127.0.0.1:8000:8000"
     env_file:
       - .env
+    volumes:
+      - outbox-data:/data
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -18,3 +20,6 @@ services:
     mem_limit: 128m
     cpus: 0.50
     stop_grace_period: 10s
+
+volumes:
+  outbox-data:

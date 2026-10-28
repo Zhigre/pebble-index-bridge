@@ -8,7 +8,7 @@ check 'root filesystem is read-only' 'docker inspect -f "{{.HostConfig.ReadonlyR
 check 'no-new-privileges enabled' 'docker inspect -f "{{json .HostConfig.SecurityOpt}}" index-bridge | grep -q no-new-privileges'
 check 'all Linux capabilities dropped' 'docker inspect -f "{{json .HostConfig.CapDrop}}" index-bridge | grep -q ALL'
 check 'host port bound to localhost only' 'docker port index-bridge 8000/tcp | grep -q "127.0.0.1:8000"'
-check 'no host bind mounts' '! docker inspect -f "{{json .HostConfig.Binds}}" index-bridge | grep -qvE "^(null|\[\])$"'
+check 'outbox volume mounted' 'docker inspect -f "{{range .Mounts}}{{if eq .Destination \"/data\"}}{{.Type}}{{end}}{{end}}" index-bridge | grep -qx volume'
 check '.env not world/group readable' 'test "$(stat -c %a .env)" = "600"'
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 exit "$fail"

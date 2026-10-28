@@ -122,7 +122,8 @@ Set the values:
 BRIDGE_TOKEN=your-generated-token
 GROKBOT_WEBHOOK_URL=https://your-grokbot-routine-webhook
 GROKBOT_WEBHOOK_KEY=crsr_your_key
-REQUEST_TIMEOUT_SECONDS=15
+REQUEST_TIMEOUT_SECONDS=45
+OUTBOX_MAX_ATTEMPTS=12
 MAX_REQUEST_BYTES=65536
 MAX_TRANSCRIPTION_CHARS=8000
 RATE_LIMIT_REQUESTS=10
@@ -171,17 +172,17 @@ curl -i -X POST http://localhost:8000/index \
   -F 'client=ring'
 ```
 
-A successful request should return HTTP `200` with a response similar to:
+An accepted request returns HTTP `202` once it is saved to the persistent outbox:
 
 ```json
 {
   "ok": true,
   "requestId": "...",
-  "grokbotStatus": 200
+  "delivery": "queued"
 }
 ```
 
-The test transcription should also arrive at your Grok Bot agent.
+The worker delivers the transcription asynchronously; check the agent and logs to confirm delivery.
 
 At this point you've proven:
 
@@ -327,8 +328,7 @@ A successful request should produce log entries similar to:
 
 ```text
 capture request_id=... client=ring recordedAt=... chars=...
-Grok Bot response request_id=... status=200 elapsed_ms=...
-POST /index ... 200 OK
+delivery kind=capture request_id=... attempt=1 status=200 elapsed_ms=...
 ```
 
 Then check the receiving Grok Bot agent. Your spoken transcription should have arrived as a message.
@@ -399,6 +399,24 @@ The bridge converts Pebble's form fields into JSON:
 }
 ```
 
+Existing installations should update `REQUEST_TIMEOUT_SECONDS=15` in `.env` to `45` before recreating the container; the existing value overrides the new default.
+
+## Delivery queue and recovery
+
+Accepted captures are stored in a Docker named volume at `/data` before the bridge returns 202. Delivery continues after container restarts. The worker retries transport failures, HTTP 408, 429, and 5xx with backoff and honours `Retry-After`; other non-2xx responses and exhausted attempts go to dead letter. The default limit is 12 attempts. Inspect and replay dead letters locally on the server:
+
+```bash
+# List pending and dead captures without displaying their text
+docker compose exec index-bridge python -m app.outbox list
+
+# Replay one dead-letter capture using its request ID
+docker compose exec index-bridge python -m app.outbox replay REQUEST_ID
+```
+
+The volume contains private transcription text. Protect it and back it up; `docker compose down -v` deletes it. Delivered records remain in the volume. The Docker health check measures process liveness, not downstream delivery; monitor the queue and delivery logs separately. Security alerts use short-lived retries but are not persisted.
+
+Retries use the same `Idempotency-Key` and `bridgeRequestId`. A timeout can occur after the receiver has processed a request, so duplicates are still possible unless the receiving webhook actively deduplicates one of these values. Non-2xx response bodies are logged in truncated, redacted form for diagnosis; downstream services should avoid returning sensitive data in error messages.
+
 ## Troubleshooting
 
 ### Is the container running?
@@ -437,7 +455,8 @@ A few useful clues:
 
 - `401` on `/index`: the Pebble/bridge token doesn't match.
 - `400 Missing transcription`: Pebble didn't send a usable transcription field.
-- `502`: the bridge received the Index request, but the Grok Bot webhook failed or rejected it.
+- `503`: the bridge could not persist the capture; check the outbox volume and disk space.
+- `delivery_dead`: delivery was rejected or exhausted its retry limit; inspect and replay it using the commands below.
 - `415` when going directly from Pebble to Grok Bot: that's the content-type mismatch this bridge was built to solve.
 
 Transcription text is not written to the bridge logs by default. Set `LOG_TRANSCRIPTIONS=true` temporarily if you need the actual text while debugging. HTTP client request logging is also suppressed so configured webhook URLs are not printed during normal operation.
@@ -479,7 +498,7 @@ The Unlicense. Use it, change it, pull it apart, or adapt it to something else.
 
 When Tailscale Funnel is enabled, Index Bridge is intentionally reachable from the public internet. This project therefore assumes hostile traffic will reach the service and uses layered controls rather than relying on obscurity.
 
-The default configuration includes: a localhost-only Docker port; bearer-token authentication with constant-time comparison; POST-only `/index`; no FastAPI docs/OpenAPI; multipart-only requests; strict form-field and transcription validation; 64 KiB request limit; authenticated rate limiting; security-event logging without transcription contents; optional separate Grok Bot security alerts; HTTPS-only Grok Bot destinations; a non-root container; read-only root filesystem; all Linux capabilities dropped; `no-new-privileges`; PID, memory and CPU limits; no host mounts or Docker socket; pinned Python dependencies; `.env` excluded from Git and the Docker build context; Dependabot; and CI secret/vulnerability scanning.
+The default configuration includes: a localhost-only Docker port; bearer-token authentication with constant-time comparison; POST-only `/index`; no FastAPI docs/OpenAPI; multipart-only requests; strict form-field and transcription validation; 64 KiB request limit; authenticated rate limiting; security-event logging without transcription contents; optional separate Grok Bot security alerts; HTTPS-only Grok Bot destinations; a non-root container; read-only root filesystem; all Linux capabilities dropped; `no-new-privileges`; PID, memory and CPU limits; a dedicated outbox volume and no Docker socket; pinned Python dependencies; `.env` excluded from Git and the Docker build context; Dependabot; and CI secret/vulnerability scanning.
 
 Optional Grok Bot security alerts are deliberately rate-limited. Configure a separate Grok Bot routine/webhook using `SECURITY_ALERT_WEBHOOK_URL` and `SECURITY_ALERT_WEBHOOK_KEY`. Alerts contain event metadata only, never the bridge token, Grok Bot key, or transcription. Suggested routine behaviour: notify the user that suspicious Index Bridge activity was detected, recommend reviewing bridge logs, and recommend disabling Tailscale Funnel if the activity appears hostile.
 

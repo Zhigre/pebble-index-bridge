@@ -6,6 +6,10 @@ import re
 import time
 import unicodedata
 import uuid
+from contextlib import asynccontextmanager
+
+from pydantic import BaseModel, ConfigDict
+from app import outbox
 from collections import deque
 from urllib.parse import urlparse
 
@@ -18,14 +22,14 @@ log = logging.getLogger("index-bridge")
 # Avoid httpx/httpcore logging full webhook URLs (webhook URLs are sensitive identifiers).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-app = FastAPI(title="Pebble Index Bridge", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
+
 
 BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
 GROKBOT_WEBHOOK_URL = os.environ["GROKBOT_WEBHOOK_URL"]
 GROKBOT_WEBHOOK_KEY = os.environ["GROKBOT_WEBHOOK_KEY"]
 SECURITY_ALERT_WEBHOOK_URL = os.getenv("SECURITY_ALERT_WEBHOOK_URL", "").strip()
 SECURITY_ALERT_WEBHOOK_KEY = os.getenv("SECURITY_ALERT_WEBHOOK_KEY", "").strip()
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
+REQUEST_TIMEOUT = httpx.Timeout(connect=10, read=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "45")), write=10, pool=10)
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "65536"))
 MAX_TRANSCRIPTION_CHARS = int(os.getenv("MAX_TRANSCRIPTION_CHARS", "8000"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
@@ -45,34 +49,106 @@ last_alert = 0.0
 state_lock = asyncio.Lock()
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# --- Delivery: keep accepted captures on disk until the downstream acknowledges them. ---
+class CapturePayload(BaseModel):
+    model_config = ConfigDict(strict=True)
+    source: str
+    transcription: str
+    recordedAt: str | None
+    client: str
+    bridgeRequestId: str
+
+
+def payload_summary(payload):
+    return {key: {"type": type(value).__name__, "length": len(value) if isinstance(value, str) else None} for key, value in payload.items()}
+
+
+def safe_response(response, payload, secret):
+    # A downstream may echo inputs or credentials; never write those values to logs.
+    body = response.text[:4096]
+    for value in list(payload.values()) + [secret]:
+        if isinstance(value, str) and value:
+            body = body.replace(value, "[redacted]")
+    return repr(body[:1024])
+
+
+async def deliver(client, url, key, payload, request_id, attempt, kind):
+    headers = {"Content-Type": "application/json", "Idempotency-Key": request_id}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    started = time.monotonic()
+    try:
+        response = await client.post(url, headers=headers, json=payload)
+    except httpx.RequestError as exc:
+        log.warning("delivery kind=%s request_id=%s attempt=%d exception=%s elapsed_ms=%d", kind, request_id, attempt, type(exc).__name__, round((time.monotonic()-started)*1000))
+        log.debug("delivery traceback", exc_info=True)
+        return False, True, type(exc).__name__, None
+    status = response.status_code
+    log.info("delivery kind=%s request_id=%s attempt=%d status=%d elapsed_ms=%d", kind, request_id, attempt, status, round((time.monotonic()-started)*1000))
+    if not 200 <= status < 300:
+        log.warning("delivery_rejected kind=%s request_id=%s status=%d body=%s payload_summary=%s", kind, request_id, status, safe_response(response, payload, key), payload_summary(payload))
+    return 200 <= status < 300, status in (408, 429) or status >= 500, f"HTTP {status}", response.headers.get("Retry-After")
+
+
+async def outbox_worker():
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        while True:
+            try:
+                item = outbox.next_item()
+                if item is None:
+                    await asyncio.sleep(1)
+                    continue
+                request_id, encoded, attempts = item
+                import json
+                payload = json.loads(encoded)
+                attempts += 1
+                ok, retryable, result, retry_after = await deliver(client, GROKBOT_WEBHOOK_URL, GROKBOT_WEBHOOK_KEY, payload, request_id, attempts, "capture")
+                state = "delivered" if ok else "pending" if retryable and attempts < outbox.MAX_ATTEMPTS else "dead"
+                outbox.finish(request_id, attempts, state, result, outbox.retry_delay(attempts, retry_after) if state == "pending" else 0)
+                if state == "dead":
+                    log.error("delivery_dead request_id=%s reason=%s", request_id, result)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.error("outbox_worker_error; retrying", exc_info=log.isEnabledFor(logging.DEBUG))
+                await asyncio.sleep(5)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Fail startup if the persistent volume is unavailable, rather than accept data we cannot save.
+    with outbox.connect():
+        pass
+    worker = asyncio.create_task(outbox_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Pebble Index Bridge", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+
+
 async def send_security_alert(event: str, severity: str, count: int, action: str):
     global last_alert
     if not SECURITY_ALERT_WEBHOOK_URL:
         return
     now = time.monotonic()
-    if now - last_alert < 300:  # avoid turning alerts into their own DoS
+    if now - last_alert < 300:
         return
     last_alert = now
-    payload = {
-        "source": "pebble-index-bridge-security",
-        "event": event,
-        "severity": severity,
-        "count": count,
-        "action": action,
-        "message": f"Index Bridge security alert: {event}. Severity {severity}. Count {count}. {action}",
-    }
-    headers = {"Content-Type": "application/json"}
-    if SECURITY_ALERT_WEBHOOK_KEY:
-        headers["Authorization"] = f"Bearer {SECURITY_ALERT_WEBHOOK_KEY}"
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.post(SECURITY_ALERT_WEBHOOK_URL, headers=headers, json=payload)
-        if response.status_code == 200:
-            log.info("security_alert_delivered event=%s status=%s", event, response.status_code)
-        else:
-            log.warning("security_alert_rejected event=%s status=%s", event, response.status_code)
-    except httpx.RequestError:
-        log.exception("security_alert_delivery_failed event=%s", event)
+    request_id = str(uuid.uuid4())
+    payload = {"source": "pebble-index-bridge-security", "event": event, "severity": severity, "count": count, "action": action, "message": f"Index Bridge security alert: {event}. Severity {severity}. Count {count}. {action}"}
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        for attempt in range(1, 4):
+            ok, retryable, _, retry_after = await deliver(client, SECURITY_ALERT_WEBHOOK_URL, SECURITY_ALERT_WEBHOOK_KEY, payload, request_id, attempt, "security_alert")
+            if ok or not retryable or attempt == 3:
+                return
+            await asyncio.sleep(outbox.retry_delay(attempt, retry_after))
 
 async def record_auth_failure():
     now = time.monotonic()
@@ -158,18 +234,10 @@ async def index_webhook(request: Request, authorization: str | None = Header(def
     if LOG_TRANSCRIPTIONS:
         log.info("transcription request_id=%s text=%r", request_id, text)
 
-    payload = {"source": "pebble-index-01", "transcription": text, "recordedAt": recorded_at, "client": client_name, "bridgeRequestId": request_id}
-    started = time.monotonic()
+    payload = CapturePayload(source="pebble-index-01", transcription=text, recordedAt=recorded_at, client=client_name, bridgeRequestId=request_id).model_dump()
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.post(GROKBOT_WEBHOOK_URL, headers={"Authorization": f"Bearer {GROKBOT_WEBHOOK_KEY}", "Content-Type": "application/json"}, json=payload)
-    except httpx.RequestError as exc:
-        log.exception("grokbot_transport_failure request_id=%s", request_id)
-        asyncio.create_task(send_security_alert("downstream_transport_failure", "MEDIUM", 1, "Grok Bot delivery failed; check connectivity and webhook configuration."))
-        raise HTTPException(status_code=502, detail=f"Grok Bot transport error: {exc.__class__.__name__}")
-
-    elapsed_ms = round((time.monotonic() - started) * 1000)
-    log.info("Grok Bot response request_id=%s status=%s elapsed_ms=%s", request_id, response.status_code, elapsed_ms)
-    if response.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Grok Bot webhook returned HTTP {response.status_code}")
-    return {"ok": True, "requestId": request_id, "grokbotStatus": response.status_code}
+        outbox.enqueue(request_id, payload)
+    except Exception:
+        log.error("outbox_enqueue_failed request_id=%s", request_id, exc_info=log.isEnabledFor(logging.DEBUG))
+        raise HTTPException(status_code=503, detail="Could not persist capture")
+    return JSONResponse({"ok": True, "requestId": request_id, "delivery": "queued"}, status_code=202)
