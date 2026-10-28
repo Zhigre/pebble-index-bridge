@@ -1,0 +1,13 @@
+# --- Secret scanning: retain defaults and exempt only the documented dummy token. ---
+[extend]
+useDefault = true
+
+[[rules]]
+id = "curl-auth-header"
+
+    [[rules.allowlists]]
+    description = "README connectivity tests deliberately use an invalid bearer token"
+    condition = "AND"
+    paths = ['''^README\.md$''']
+    regexTarget = "secret"
+    regexes = ['''^deliberately-wrong$''']
